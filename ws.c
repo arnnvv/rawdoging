@@ -13,14 +13,16 @@
 #include <fcntl.h>
 #include <stdbool.h>
 #include <sys/time.h>
+#include <openssl/evp.h>
 
 #define PORT 8080
+#define MAX_CLIENTS  FD_SETSIZE
+#define BUFFER_SIZE  4096
 
 // Magic GUID from the WebSocket protocol spec
 static const char *WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 // Base64 encoding (OpenSSL's EVP_EncodeBlock)
-#include <openssl/evp.h>
 static void base64_encode(const unsigned char *input, int length, char *output) {
     EVP_EncodeBlock((unsigned char*)output, input, length);
 }
@@ -152,11 +154,13 @@ static int read_frame(int fd, unsigned char *buf, size_t bufsize, bool *is_text,
 
 static int send_text_frame(int fd, const unsigned char *msg, size_t len) {
     unsigned char header[2];
-    header[0] = 0x81;
+    header[0] = 0x81; // FIN + Text frame
+    // For simplicity, assuming length < 126
+    // For larger messages, you'd need extended length handling.
     header[1] = (unsigned char)len;
 
     if (send(fd, header, 2, 0) != 2) return -1;
-    if (len > 0 && send(fd, msg, len, 0) != (int)len) return -1;
+    if (len > 0 && send(fd, msg, (int)len, 0) != (int)len) return -1;
     return 0;
 }
 
@@ -181,71 +185,121 @@ int main() {
         exit(1);
     }
 
-    if (listen(server_fd, 1) < 0) {
+    if (listen(server_fd, 5) < 0) {
         perror("listen");
         exit(1);
     }
 
     printf("WebSocket server listening on port %d\n", PORT);
 
+    fd_set master_set, read_set;
+    FD_ZERO(&master_set);
+    FD_SET(server_fd, &master_set);
+    int max_fd = server_fd;
+
+    int clients[MAX_CLIENTS];
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        clients[i] = -1;
+    }
+
     while (1) {
-        struct sockaddr_in client_addr;
-        socklen_t client_len = sizeof(client_addr);
-        int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
-        if (client_fd < 0) {
-            perror("accept");
-            continue;
+        read_set = master_set;
+        int ret = select(max_fd+1, &read_set, NULL, NULL, NULL);
+        if (ret < 0) {
+            perror("select");
+            break;
         }
-        printf("Client connected\n");
 
-        if (do_handshake(client_fd) < 0) {
-            close(client_fd);
-            continue;
-        }
-        printf("Handshake complete. Upgraded to WebSocket.\n");
-
-        fd_set readfds;
-        unsigned char buffer[4096];
-
-        while (1) {
-            FD_ZERO(&readfds);
-            FD_SET(client_fd, &readfds);
-
-            int ret = select(client_fd+1, &readfds, NULL, NULL, NULL);
-            if (ret < 0) {
-                perror("select");
-                break;
+        // Check for new connections
+        if (FD_ISSET(server_fd, &read_set)) {
+            struct sockaddr_in client_addr;
+            socklen_t client_len = sizeof(client_addr);
+            int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
+            if (client_fd < 0) {
+                perror("accept");
+                continue;
             }
 
-            if (FD_ISSET(client_fd, &readfds)) {
+            printf("Client connected\n");
+
+            if (do_handshake(client_fd) < 0) {
+                close(client_fd);
+                continue;
+            }
+            printf("Handshake complete. Upgraded to WebSocket.\n");
+
+            // Add client to the clients array
+            int i;
+            for (i = 0; i < MAX_CLIENTS; i++) {
+                if (clients[i] < 0) {
+                    clients[i] = client_fd;
+                    break;
+                }
+            }
+
+            if (i == MAX_CLIENTS) {
+                // Too many clients
+                fprintf(stderr, "Too many clients connected.\n");
+                close(client_fd);
+            } else {
+                FD_SET(client_fd, &master_set);
+                if (client_fd > max_fd) {
+                    max_fd = client_fd;
+                }
+            }
+        }
+
+        // Check existing clients
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            int cfd = clients[i];
+            if (cfd < 0) continue;
+
+            if (FD_ISSET(cfd, &read_set)) {
                 bool is_text = false;
                 bool is_close = false;
-                int len = read_frame(client_fd, buffer, sizeof(buffer)-1, &is_text, &is_close);
+                unsigned char buffer[BUFFER_SIZE];
+                int len = read_frame(cfd, buffer, sizeof(buffer)-1, &is_text, &is_close);
                 if (len < 0) {
-                    printf("Error reading frame, closing.\n");
-                    break;
+                    printf("Error reading frame, closing client.\n");
+                    close(cfd);
+                    FD_CLR(cfd, &master_set);
+                    clients[i] = -1;
+                    continue;
                 }
                 if (is_close) {
                     printf("Close frame received, closing connection.\n");
-                    break;
+                    close(cfd);
+                    FD_CLR(cfd, &master_set);
+                    clients[i] = -1;
+                    continue;
                 }
 
-                if (is_text) {
-                    printf("Received message: %s\n", buffer);
-                    // Echo back
-                    if (send_text_frame(client_fd, buffer, len) < 0) {
-                        printf("Error sending frame, closing.\n");
-                        break;
+                if (is_text && len > 0) {
+                    printf("Received message from client %d: %s\n", cfd, buffer);
+
+                    // Broadcast to all other clients
+                    for (int j = 0; j < MAX_CLIENTS; j++) {
+                        int other_fd = clients[j];
+                        if (other_fd < 0 || other_fd == cfd) {
+                            continue;
+                        }
+                        if (send_text_frame(other_fd, buffer, len) < 0) {
+                            printf("Error sending frame to client %d, closing.\n", other_fd);
+                            close(other_fd);
+                            FD_CLR(other_fd, &master_set);
+                            clients[j] = -1;
+                        }
                     }
-                } else {
                 }
             }
         }
 
-        close(client_fd);
-        printf("Client disconnected\n");
     }
 
+    // Cleanup
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i] >= 0) close(clients[i]);
+    }
     close(server_fd);
     return 0;
 }
